@@ -1,0 +1,309 @@
+#!/bin/bash
+
+# =============================================================================
+# pCloud Sync Script
+# Syncs local folders to pCloud encrypted remote with safety checks
+# =============================================================================
+
+# --- 1. SCRIPT LOCATION & CONFIG ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/pcloud_sync.conf"
+
+# --- 2. SAFE DEFAULTS (override in config file) ---
+SUBFOLDER=""
+SOURCE_ROOT="/mnt/data"
+DEST_ROOT="pcloud:backup"
+DIFF_LOG="/tmp/pcloud_diff.log"
+STATUS_FILE="/tmp/pcloud_last_sync_status"
+HISTORY_FILE="/tmp/pcloud_history.csv"
+LOCKFILE="/tmp/pcloud_sync.lock"
+EMAIL_RECIPIENT=""
+
+# Sync Settings
+TRANSFERS=1
+MAX_DELETES=100
+VERIFY_SAMPLE_COUNT=5
+
+# Bandwidth Schedule (if enabled with -b)
+BW_DAYTIME="2M"      # 09:00-23:00
+BW_NIGHTTIME="0"     # Unlimited
+
+# --- 3. LOAD CONFIG FILE ---
+if [ -f "$CONFIG_FILE" ]; then
+    echo "Loading config: $CONFIG_FILE"
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+else
+    echo "WARNING: Config file not found: $CONFIG_FILE"
+    echo "Using defaults. Create config file from pcloud_sync.conf.example"
+fi
+
+# --- 4. RUNTIME FLAGS ---
+CHECK_ONLY=false
+VERIFY_SAMPLES=false
+USE_BW_SCHEDULE=false
+DRY_RUN=false
+
+# --- 5. HELP FUNCTION ---
+usage() {
+    cat << EOF
+Usage: $0 [OPTIONS] [subfolder]
+
+Options:
+  -c    Check only: Generate report and email, but do NOT sync data.
+  -n    Dry run: Show what would be transferred without actually doing it.
+  -v    Verify: After sync, spot-check $VERIFY_SAMPLE_COUNT random files via download+hash.
+  -b    Bandwidth scheduling: Throttle to $BW_DAYTIME during daytime (09-23h).
+  -h    Help: Show this help message.
+
+Config file: $CONFIG_FILE
+
+Current Settings:
+  Source Root: $SOURCE_ROOT
+  Dest Root:   $DEST_ROOT
+  Transfers:   $TRANSFERS
+  Max Deletes: $MAX_DELETES
+  Email:       ${EMAIL_RECIPIENT:-"(none)"}
+
+Examples:
+  $0                     # Sync default subfolder
+  $0 -c                  # Check only, no sync
+  $0 -bv Music/          # Sync Music with BW scheduling and verification
+  $0 -n Photos/          # Dry run on Photos
+EOF
+    exit 1
+}
+
+# --- 6. FLAG PARSING ---
+while getopts "cnvbh" opt; do
+    case $opt in
+        c) CHECK_ONLY=true ;;
+        n) DRY_RUN=true ;;
+        v) VERIFY_SAMPLES=true ;;
+        b) USE_BW_SCHEDULE=true ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+if [ -n "$1" ]; then
+    SUBFOLDER="$1"
+fi
+
+# Ensure trailing slash if subfolder specified
+if [ -n "$SUBFOLDER" ]; then
+    [[ "$SUBFOLDER" != */ ]] && SUBFOLDER="$SUBFOLDER/"
+fi
+
+SOURCE="${SOURCE_ROOT}/${SUBFOLDER}"
+DEST="${DEST_ROOT}/${SUBFOLDER}"
+
+# --- 7. LOCKFILE (prevent overlapping runs) ---
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+    echo "Another sync is already running. Exiting."
+    exit 1
+fi
+
+# --- 8. PRE-FLIGHT CHECKS ---
+if [ ! -f "$SOURCE_ROOT/.drive_is_mounted" ]; then
+    STATE="CRITICAL"
+    SUMMARY="Mount Error: $SOURCE_ROOT not detected."
+    echo -e "STATE=\"$STATE\"\nTIMESTAMP=\"$(date '+%Y-%m-%d %H:%M:%S')\"\nMESSAGE=\"$SUMMARY\"" > "$STATUS_FILE"
+    if [ -n "$EMAIL_RECIPIENT" ]; then
+        printf "Subject: Backup CRITICAL\n\n%s" "$SUMMARY" | msmtp "$EMAIL_RECIPIENT"
+    fi
+    exit 1
+fi
+
+if [ ! -d "$SOURCE" ]; then
+    echo "ERROR: Source directory does not exist: $SOURCE"
+    exit 1
+fi
+
+# --- 9. BANDWIDTH SCHEDULING ---
+BWLIMIT_FLAG=""
+if [ "$USE_BW_SCHEDULE" = true ]; then
+    HOUR=$(date +%H)
+    if [ "$HOUR" -ge 9 ] && [ "$HOUR" -lt 23 ]; then
+        BWLIMIT_FLAG="--bwlimit $BW_DAYTIME"
+        echo "Bandwidth scheduling: Daytime mode ($BW_DAYTIME)"
+    else
+        BWLIMIT_FLAG="--bwlimit $BW_NIGHTTIME"
+        echo "Bandwidth scheduling: Nighttime mode (unlimited)"
+    fi
+fi
+
+# --- 10. GENERATE PRE-SYNC REPORT ---
+echo "Comparing ${SUBFOLDER:-(root)} (size-only)..."
+rclone check "$SOURCE" "$DEST" --size-only --one-way --combined - 2>/dev/null | grep -v "^=" > "$DIFF_LOG"
+
+ADDED=$(grep -c "^+" "$DIFF_LOG" || echo 0)
+REMOVED=$(grep -c "^-" "$DIFF_LOG" || echo 0)
+MODIFIED=$(grep -c "^\*" "$DIFF_LOG" || echo 0)
+TOTAL_CHANGES=$((ADDED + REMOVED + MODIFIED))
+
+# --- 11. EXECUTION LOGIC ---
+SYNC_LOG=$(mktemp)
+EXIT_STATUS=0
+
+if [ "$CHECK_ONLY" = true ]; then
+    STATE="REPORT"
+    SUMMARY="CHECK ONLY: $TOTAL_CHANGES changes detected ($ADDED new, $REMOVED missing)."
+    echo "----------------------------------------------"
+    echo "$SUMMARY"
+    [ "$TOTAL_CHANGES" -gt 0 ] && cat "$DIFF_LOG" || echo "No changes detected."
+
+elif [ "$DRY_RUN" = true ]; then
+    STATE="DRY-RUN"
+    echo "Dry run: $SOURCE -> $DEST"
+    rclone sync "$SOURCE" "$DEST" \
+        --size-only \
+        --dry-run \
+        -v 2>&1 | tee "$SYNC_LOG"
+    SUMMARY="DRY RUN: Would sync $TOTAL_CHANGES changes."
+
+else
+    echo "Starting Sync: $SOURCE -> $DEST"
+
+    # Build rclone command
+    # shellcheck disable=SC2086
+    rclone sync "$SOURCE" "$DEST" \
+        --size-only \
+        --ignore-checksum \
+        --fast-list \
+        --check-first \
+        --max-delete "$MAX_DELETES" \
+        --transfers "$TRANSFERS" \
+        --retries 5 \
+        --retries-sleep 30s \
+        --low-level-retries 10 \
+        --min-age 5m \
+        --use-mmap \
+        --contimeout 60s \
+        --timeout 300s \
+        --delete-after \
+        --backup-dir "${DEST_ROOT}/archive/$(date +%Y-%m-%d)/${SUBFOLDER}" \
+        --stats 5m \
+        --stats-log-level NOTICE \
+        $BWLIMIT_FLAG \
+        -v 2>&1 | tee "$SYNC_LOG"
+
+    EXIT_STATUS=${PIPESTATUS[0]}
+
+    # Parse results
+    ACTUAL_STATS=$(grep "Transferred:" "$SYNC_LOG" | tail -n 1)
+    ERROR_COUNT=$(grep -c "ERROR" "$SYNC_LOG" || echo 0)
+
+    case $EXIT_STATUS in
+        0) STATE="SUCCESS"; SUMMARY="Sync complete. $ACTUAL_STATS" ;;
+        1) STATE="ERROR"; SUMMARY="Syntax or usage error" ;;
+        3) STATE="ERROR"; SUMMARY="Directory not found" ;;
+        5) STATE="ERROR"; SUMMARY="Temporary error (retries exhausted)" ;;
+        6) STATE="WARNING"; SUMMARY="Some transfers failed. Errors: $ERROR_COUNT" ;;
+        7) STATE="ERROR"; SUMMARY="Fatal error" ;;
+        8) STATE="ABORTED"; SUMMARY="Safety abort: Over $MAX_DELETES deletes requested" ;;
+        *) STATE="ERROR"; SUMMARY="Unknown exit code: $EXIT_STATUS" ;;
+    esac
+fi
+
+# --- 12. OPTIONAL: SPOT-CHECK VERIFICATION ---
+VERIFY_RESULTS=""
+if [ "$VERIFY_SAMPLES" = true ] && [ "$CHECK_ONLY" = false ] && [ "$DRY_RUN" = false ] && [ "$EXIT_STATUS" -eq 0 ]; then
+    echo ""
+    echo "Running spot-check verification on $VERIFY_SAMPLE_COUNT random files..."
+    
+    VERIFY_FAILURES=0
+    VERIFY_CHECKED=0
+    
+    # Get random sample of files
+    SAMPLE_FILES=$(rclone lsf "$DEST" --files-only -R 2>/dev/null | shuf -n "$VERIFY_SAMPLE_COUNT")
+    
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        
+        LOCAL_FILE="$SOURCE$f"
+        if [ ! -f "$LOCAL_FILE" ]; then
+            echo "  SKIP (local missing): $f"
+            continue
+        fi
+        
+        ((VERIFY_CHECKED++))
+        LOCAL_HASH=$(sha256sum "$LOCAL_FILE" 2>/dev/null | cut -d' ' -f1)
+        REMOTE_HASH=$(rclone cat "$DEST$f" 2>/dev/null | sha256sum | cut -d' ' -f1)
+        
+        if [ "$REMOTE_HASH" != "$LOCAL_HASH" ]; then
+            echo "  MISMATCH: $f"
+            ((VERIFY_FAILURES++))
+        else
+            echo "  OK: $f"
+        fi
+    done <<< "$SAMPLE_FILES"
+    
+    VERIFY_RESULTS="Verified $VERIFY_CHECKED files, $VERIFY_FAILURES mismatches."
+    echo "$VERIFY_RESULTS"
+    
+    if [ "$VERIFY_FAILURES" -gt 0 ]; then
+        STATE="WARNING"
+        SUMMARY="$SUMMARY | VERIFY FAILED: $VERIFY_FAILURES mismatches"
+    fi
+fi
+
+# --- 13. STATUS FILE ---
+SAFE_SUMMARY=$(echo "$SUMMARY" | sed 's/"//g')
+{
+    echo "STATE=\"$STATE\""
+    echo "TIMESTAMP=\"$(date '+%Y-%m-%d %H:%M:%S')\""
+    echo "SUBFOLDER=\"${SUBFOLDER:-(root)}\""
+    echo "MESSAGE=\"$SAFE_SUMMARY\""
+} > "$STATUS_FILE"
+
+# --- 14. HISTORY LOG (for trending) ---
+if [ ! -f "$HISTORY_FILE" ]; then
+    echo "timestamp,subfolder,added,removed,modified,exit_status,state" > "$HISTORY_FILE"
+fi
+echo "$(date -Iseconds),${SUBFOLDER:-(root)},$ADDED,$REMOVED,$MODIFIED,$EXIT_STATUS,$STATE" >> "$HISTORY_FILE"
+
+# --- 15. EMAIL NOTIFICATION ---
+if [ -n "$EMAIL_RECIPIENT" ]; then
+    {
+        echo "Subject: Backup $STATE - ${SUBFOLDER:-(root)}"
+        echo ""
+        echo "Status: $STATE"
+        echo "Folder: ${SUBFOLDER:-(root)}"
+        echo "Summary: $SUMMARY"
+        [ -n "$VERIFY_RESULTS" ] && echo "Verification: $VERIFY_RESULTS"
+        echo ""
+        echo "Settings: Transfers=$TRANSFERS, MaxDeletes=$MAX_DELETES"
+        [ -n "$BWLIMIT_FLAG" ] && echo "Bandwidth: $BWLIMIT_FLAG"
+        echo "Time: $(date)"
+        echo "----------------------------------------------"
+        
+        if [ "$CHECK_ONLY" = false ] && [ "$DRY_RUN" = false ] && [ -f "$SYNC_LOG" ]; then
+            echo ""
+            echo "TRANSFER LOG (last 20 lines):"
+            tail -n 20 "$SYNC_LOG"
+            echo ""
+            echo "----------------------------------------------"
+        fi
+
+        echo ""
+        echo "PRE-SYNC CHANGE LIST:"
+        if [ "$TOTAL_CHANGES" -gt 0 ]; then
+            cat "$DIFF_LOG"
+        else
+            echo "No file changes detected."
+        fi
+    } | msmtp "$EMAIL_RECIPIENT"
+else
+    echo "Email notifications disabled (no EMAIL_RECIPIENT configured)"
+fi
+
+# --- 16. CLEANUP ---
+[ -f "$SYNC_LOG" ] && rm -f "$SYNC_LOG"
+
+echo ""
+echo "Process complete. Status: $STATE"
+exit $EXIT_STATUS
