@@ -13,6 +13,7 @@ CONFIG_FILE="$SCRIPT_DIR/pcloud_sync.conf"
 SUBFOLDER=""
 SOURCE_ROOT="/mnt/data"
 DEST_ROOT="pcloud:backup"
+ARCHIVE_ROOT=""
 DIFF_LOG="/tmp/pcloud_diff.log"
 STATUS_FILE="/tmp/pcloud_last_sync_status"
 HISTORY_FILE="/tmp/pcloud_history.csv"
@@ -38,11 +39,16 @@ else
     echo "Using defaults. Create config file from pcloud_sync.conf.example"
 fi
 
+if [ -z "$ARCHIVE_ROOT" ]; then
+    ARCHIVE_ROOT="${DEST_ROOT}_archive"
+fi
+
 # --- 4. RUNTIME FLAGS ---
 CHECK_ONLY=false
 VERIFY_SAMPLES=false
 USE_BW_SCHEDULE=false
 DRY_RUN=false
+PERMANENT_DELETE=false
 
 # --- 5. HELP FUNCTION ---
 usage() {
@@ -52,6 +58,7 @@ Usage: $0 [OPTIONS] [subfolder]
 Options:
   -c    Check only: Generate report and email, but do NOT sync data.
   -n    Dry run: Show what would be transferred without actually doing it.
+  -d    Delete permanently: Do NOT move deleted files to archive (delete directly).
   -v    Verify: After sync, spot-check $VERIFY_SAMPLE_COUNT random files via download+hash.
   -b    Bandwidth scheduling: Throttle to $BW_DAYTIME during daytime (09-23h).
   -h    Help: Show this help message.
@@ -61,6 +68,7 @@ Config file: $CONFIG_FILE
 Current Settings:
   Source Root: $SOURCE_ROOT
   Dest Root:   $DEST_ROOT
+  Archive Root: $ARCHIVE_ROOT
   Transfers:   $TRANSFERS
   Max Deletes: $MAX_DELETES
   Email:       ${EMAIL_RECIPIENT:-"(none)"}
@@ -68,6 +76,7 @@ Current Settings:
 Examples:
   $0                     # Sync default subfolder
   $0 -c                  # Check only, no sync
+  $0 -d                  # Sync and permanently delete missing files
   $0 -bv Music/          # Sync Music with BW scheduling and verification
   $0 -n Photos/          # Dry run on Photos
 EOF
@@ -75,12 +84,13 @@ EOF
 }
 
 # --- 6. FLAG PARSING ---
-while getopts "cnvbh" opt; do
+while getopts "cnvbdh" opt; do
     case $opt in
         c) CHECK_ONLY=true ;;
         n) DRY_RUN=true ;;
         v) VERIFY_SAMPLES=true ;;
         b) USE_BW_SCHEDULE=true ;;
+        d) PERMANENT_DELETE=true ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -118,6 +128,65 @@ if [ ! -f "$SOURCE_ROOT/.drive_is_mounted" ]; then
     exit 1
 fi
 
+# --- 8b. SOURCE DRIVE HEALTH ---
+# A failing/read-only/flaky source can look like missing files to rclone sync
+# and trigger remote deletions, so refuse to run rather than risk it.
+preflight_fail() {
+    STATE="CRITICAL"
+    SUMMARY="$1"
+    echo "CRITICAL: $SUMMARY"
+    echo -e "STATE=\"$STATE\"\nTIMESTAMP=\"$(date '+%Y-%m-%d %H:%M:%S')\"\nMESSAGE=\"$SUMMARY\"" > "$STATUS_FILE"
+    if [ -n "$EMAIL_RECIPIENT" ]; then
+        printf "Subject: Backup CRITICAL\n\n%s" "$SUMMARY" | msmtp "$EMAIL_RECIPIENT"
+    fi
+    exit 1
+}
+
+SRC_DEV=$(findmnt -no SOURCE "$SOURCE_ROOT" 2>/dev/null)
+SRC_OPTS=$(findmnt -no OPTIONS "$SOURCE_ROOT" 2>/dev/null)
+HEALTH_NOTES=""
+
+# 1. Filesystem remounted read-only (errors=remount-ro)
+case ",$SRC_OPTS," in
+    *,ro,*) preflight_fail "Source $SOURCE_ROOT is mounted read-only (filesystem errors?)" ;;
+esac
+
+# 2. Readable within a timeout (a hung USB disk would block forever otherwise)
+timeout 60 ls "$SOURCE_ROOT" >/dev/null 2>&1 || preflight_fail "Source $SOURCE_ROOT not readable (timeout or I/O error)"
+
+if [[ "$SRC_DEV" == /dev/* ]]; then
+    # Whole-disk device for SMART/kernel checks (SRC_DEV may be a partition)
+    PARENT=$(lsblk -no PKNAME "$SRC_DEV" 2>/dev/null | head -n1)
+    DISK_DEV="${PARENT:+/dev/$PARENT}"
+    DISK_DEV="${DISK_DEV:-$SRC_DEV}"
+    DEV_BASE=$(basename "$DISK_DEV")
+
+    # 3. Kernel I/O errors on the device in the last 24h
+    if journalctl -k --since "-24h" --no-pager 2>/dev/null | grep -q "I/O error, dev $DEV_BASE"; then
+        preflight_fail "Kernel I/O errors on $DISK_DEV in the last 24h"
+    fi
+
+    # 4. SMART: exit bit 3 (8) = disk failing, bit 4 (16) = prefail attribute at/below threshold
+    if command -v smartctl >/dev/null 2>&1; then
+        smartctl -H "$DISK_DEV" >/dev/null 2>&1
+        SMART_RC=$?
+        if [ $((SMART_RC & 24)) -ne 0 ]; then
+            preflight_fail "SMART health check failed on $DISK_DEV (smartctl exit $SMART_RC)"
+        fi
+        BAD_SECTORS=$(smartctl -A "$DISK_DEV" 2>/dev/null | awk '$1==5||$1==197||$1==198 {s+=$10} END{print s+0}')
+        if [ "${BAD_SECTORS:-0}" -gt 0 ]; then
+            HEALTH_NOTES="WARNING: $BAD_SECTORS bad sectors reported by SMART on $DISK_DEV"
+            echo "$HEALTH_NOTES"
+        fi
+        HEALTH_MSG="Source health: OK ($DISK_DEV, rw, SMART passed, no kernel I/O errors in 24h)"
+    else
+        HEALTH_MSG="Source health: rw and readable, no kernel I/O errors in 24h (smartctl not installed, SMART skipped)"
+    fi
+else
+    HEALTH_MSG="Source health: rw and readable ($SRC_DEV is not a block device, SMART/kernel checks skipped)"
+fi
+echo "$HEALTH_MSG"
+
 if [ ! -d "$SOURCE" ]; then
     echo "ERROR: Source directory does not exist: $SOURCE"
     exit 1
@@ -140,14 +209,24 @@ fi
 echo "Comparing ${SUBFOLDER:-(root)} (size-only)..."
 rclone check "$SOURCE" "$DEST" --size-only --one-way --combined - 2>/dev/null | grep -v "^=" > "$DIFF_LOG"
 
-ADDED=$(grep -c "^+" "$DIFF_LOG" || echo 0)
-REMOVED=$(grep -c "^-" "$DIFF_LOG" || echo 0)
-MODIFIED=$(grep -c "^\*" "$DIFF_LOG" || echo 0)
+ADDED=$(grep -c "^+" "$DIFF_LOG" 2>/dev/null || true)
+REMOVED=$(grep -c "^-" "$DIFF_LOG" 2>/dev/null || true)
+MODIFIED=$(grep -c "^\*" "$DIFF_LOG" 2>/dev/null || true)
+ADDED=${ADDED:-0}
+REMOVED=${REMOVED:-0}
+MODIFIED=${MODIFIED:-0}
 TOTAL_CHANGES=$((ADDED + REMOVED + MODIFIED))
 
 # --- 11. EXECUTION LOGIC ---
 SYNC_LOG=$(mktemp)
 EXIT_STATUS=0
+
+ARCHIVE_FLAG=""
+if [ "$PERMANENT_DELETE" = false ]; then
+    ARCHIVE_FLAG="--backup-dir ${ARCHIVE_ROOT}/$(date +%Y-%m-%d)/${SUBFOLDER}"
+else
+    echo "Mode: Permanent delete enabled (-d). Missing remote files will be deleted, not archived."
+fi
 
 if [ "$CHECK_ONLY" = true ]; then
     STATE="REPORT"
@@ -159,9 +238,12 @@ if [ "$CHECK_ONLY" = true ]; then
 elif [ "$DRY_RUN" = true ]; then
     STATE="DRY-RUN"
     echo "Dry run: $SOURCE -> $DEST"
+    [ "$PERMANENT_DELETE" = true ] && echo "Mode: Permanent delete (no archive)"
+    # shellcheck disable=SC2086
     rclone sync "$SOURCE" "$DEST" \
         --size-only \
         --dry-run \
+        $ARCHIVE_FLAG \
         -v 2>&1 | tee "$SYNC_LOG"
     SUMMARY="DRY RUN: Would sync $TOTAL_CHANGES changes."
 
@@ -185,7 +267,7 @@ else
         --contimeout 60s \
         --timeout 300s \
         --delete-after \
-        --backup-dir "${DEST_ROOT}/archive/$(date +%Y-%m-%d)/${SUBFOLDER}" \
+        $ARCHIVE_FLAG \
         --stats 5m \
         --stats-log-level NOTICE \
         $BWLIMIT_FLAG \
@@ -258,6 +340,7 @@ SAFE_SUMMARY=$(echo "$SUMMARY" | sed 's/"//g')
     echo "TIMESTAMP=\"$(date '+%Y-%m-%d %H:%M:%S')\""
     echo "SUBFOLDER=\"${SUBFOLDER:-(root)}\""
     echo "MESSAGE=\"$SAFE_SUMMARY\""
+    echo "HEALTH=\"$(echo "$HEALTH_MSG" | sed 's/"//g')\""
 } > "$STATUS_FILE"
 
 # --- 14. HISTORY LOG (for trending) ---
@@ -274,6 +357,8 @@ if [ -n "$EMAIL_RECIPIENT" ]; then
         echo "Status: $STATE"
         echo "Folder: ${SUBFOLDER:-(root)}"
         echo "Summary: $SUMMARY"
+        echo "$HEALTH_MSG"
+        [ -n "$HEALTH_NOTES" ] && echo "$HEALTH_NOTES"
         [ -n "$VERIFY_RESULTS" ] && echo "Verification: $VERIFY_RESULTS"
         echo ""
         echo "Settings: Transfers=$TRANSFERS, MaxDeletes=$MAX_DELETES"

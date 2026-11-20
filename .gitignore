@@ -1,0 +1,6 @@
+# runtime state and local config
+pcloud_sync.conf
+history.csv
+last_sync_status
+diff.log
+*.bak

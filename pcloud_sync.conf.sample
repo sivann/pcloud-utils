@@ -8,11 +8,15 @@
 SOURCE_ROOT="/media/4tb"
 
 # Destination root (rclone remote)
-DEST_ROOT="pcloud_encrypted:xxx/yyy"
+DEST_ROOT="pcloud_encrypted:media/greenflame"
+
+# Archive root (where deleted/modified files are moved if not using -d)
+# Must NOT be inside DEST_ROOT to prevent overlapping sync errors
+ARCHIVE_ROOT="pcloud_encrypted:media/greenflame_archive"
 
 # Default subfolder to sync (can be overridden via command line)
 # Leave empty to sync entire SOURCE_ROOT
-SUBFOLDER="05-mycontent/"
+SUBFOLDER=""
 
 # --- LOG & STATE FILES ---
 DIFF_LOG="/opt/backup/diff.log"
